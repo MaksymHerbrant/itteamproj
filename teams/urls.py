@@ -31,4 +31,9 @@ urlpatterns = [
     path('teams/respond-invite/<uuid:invite_id>/', views.respond_team_invite, name='respond_team_invite'),
     path('teams/action/<uuid:team_id>/', views.team_action, name='team_action'),
     path('messages/<uuid:room_id>/send/', views.send_message, name='send_message'),
+    path('chat/create/<str:target_type>/<uuid:target_id>/', views.create_direct_chat, name='create_direct_chat'),
+    
+    path('payments/', views.payments_view, name='payments'),
+    path('payments/<uuid:project_id>/process/', views.process_payment, name='process_payment'), # Замініть int на uuid, якщо id проєкту - UUID
+    path('projects/<uuid:project_id>/confirm-payment/', views.confirm_payment, name='confirm_payment'),
 ]

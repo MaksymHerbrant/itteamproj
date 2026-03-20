@@ -7,6 +7,7 @@ from django.contrib.auth.decorators import login_required
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.http import JsonResponse
+from decimal import Decimal
 
 def auth_view(request):
     print("\n" + "="*40)
@@ -88,6 +89,8 @@ def index(request):
     return render(request, 'index.html')
 
 # --- ГОЛОВНІ СТОРІНКИ (ДИНАМІЧНІ ДЛЯ ОБОХ РОЛЕЙ) ---
+# Додай ці зміни у свій views.py
+
 @login_required
 def dashboard(request):
     context = {}
@@ -103,24 +106,27 @@ def dashboard(request):
     context['available_stacks'] = sorted(list(unique_tags))
 
     if request.user.role == 'client':
+        # --- ЗАМОВНИК ---
         developers = DeveloperProfile.objects.select_related('user').all()
-        # НОВЕ: Пошук команд
+        # ШУКАЄМО КОМАНДИ
         teams = Team.objects.select_related('captain').prefetch_related('members').all()
 
         if keyword:
-            developers = developers.filter(Q(user__display_name__icontains=keyword) | Q(title__icontains=keyword))
-            # Фільтр для команд по назві або спеціалізації
-            teams = teams.filter(Q(name__icontains=keyword) | Q(specialization__icontains=keyword))
+            developers = developers.filter(Q(user__display_name__icontains=keyword) | Q(title__icontains=keyword) | Q(bio__icontains=keyword))
+            # Фільтруємо команди по назві, спеціалізації або опису
+            teams = teams.filter(Q(name__icontains=keyword) | Q(specialization__icontains=keyword) | Q(description__icontains=keyword))
         
         if stack_filter:
             developers = developers.filter(stack__icontains=stack_filter)
+            # Фільтруємо команди за спеціалізацією (стеком)
             teams = teams.filter(specialization__icontains=stack_filter)
 
         context['developers'] = developers
-        context['teams'] = teams # Передаємо команди в шаблон
+        context['teams'] = teams # Віддаємо команди в шаблон
+        context['my_projects'] = Project.objects.filter(client=request.user).order_by('-created_at')
 
     else:
-        # --- РОЗРОБНИК ---
+        # --- РОЗРОБНИК (твій оригінальний код, нічого не міняємо) ---
         budget_filter = request.GET.get('budget', '')
         projects = Project.objects.select_related('client').all().order_by('-created_at')
         
@@ -136,11 +142,34 @@ def dashboard(request):
             projects = projects.filter(budget__gt=5000)
             
         context['projects'] = projects
-        
-        # ДОДАНО: Дістаємо команди, де юзер є капітаном або учасником
         context['my_teams'] = Team.objects.filter(Q(captain=request.user) | Q(members=request.user)).distinct()
 
     return render(request, 'dashboard.html', context)
+
+# НОВИЙ МЕТОД: Створення чату з кнопки "Написати"
+@login_required
+def create_direct_chat(request, target_type, target_id):
+    """Створює чат: замовник + соло або замовник + вся команда"""
+    room_name = ""
+    participants = [request.user]
+
+    if target_type == 'solo':
+        target_user = get_object_or_404(User, id=target_id)
+        room_name = f"Чат: {target_user.display_name}"
+        participants.append(target_user)
+    elif target_type == 'team':
+        team = get_object_or_404(Team, id=target_id)
+        room_name = f"Груповий чат: {team.name}"
+        participants.append(team.captain)
+        for member in team.members.all():
+            participants.append(member)
+
+    # Шукаємо існуючу кімнату з такою назвою або створюємо нову
+    room, created = ChatRoom.objects.get_or_create(name=room_name)
+    if created:
+        room.participants.set(participants)
+    
+    return redirect(f'/messages/?room_id={room.id}')
 
 
 def messages_view(request):
@@ -582,3 +611,78 @@ def send_message(request, room_id):
                 return JsonResponse({'status': 'ok'})
                 
     return redirect(f'/messages/?room_id={room_id}')
+
+@login_required
+def payments_view(request):
+    """Сторінка оплат (спільна, але з різним вмістом для Замовника та Розробника)"""
+    context = {
+        'role_name': request.user.get_role_display(),
+    }
+
+    if request.user.role == 'client':
+        # --- ЗАМОВНИК БАЧИТЬ: Кому він має заплатити ---
+        # Проєкти, де є затверджені заявки
+        projects = Project.objects.filter(
+            client=request.user, 
+            applications__status='approved'
+        ).distinct()
+        
+        # Рахуємо загальний баланс "Заморожено" для віджета
+        frozen_sum = sum(p.final_price for p in projects if p.payment_status in ['frozen', 'paid'] and p.final_price)
+        
+        context['projects_in_progress'] = projects
+        context['frozen_sum'] = frozen_sum
+
+    else:
+        # --- РОЗРОБНИК БАЧИТЬ: Де його гроші ---
+        # Шукаємо всі схвалені заявки цього розробника (соло або як частина команди)
+        my_apps = ProjectApplication.objects.filter(
+            status='approved'
+        ).filter(
+            Q(developer=request.user) | 
+            Q(team__members=request.user) | 
+            Q(team__captain=request.user)
+        ).select_related('project').distinct()
+        
+        # Відбираємо тільки ті проєкти, де гроші вже "заморожені" клієнтом або "оплачені"
+        projects = [app.project for app in my_apps if app.project.payment_status in ['frozen', 'paid']]
+        
+        # Рахуємо, скільки грошей заморожено для цього розробника
+        frozen_sum = sum(p.final_price for p in projects if p.final_price)
+        
+        context['projects_in_progress'] = projects
+        context['frozen_sum'] = frozen_sum
+
+    return render(request, 'payments.html', context)
+
+@login_required
+def confirm_payment(request, project_id):
+    """Розробник підтверджує, що оплата заморожена і він готовий працювати"""
+    if request.method == 'POST' and request.user.role == 'developer':
+        # Перевіряємо, чи цей розробник (або його команда) дійсно працює над цим проєктом
+        app = get_object_or_404(ProjectApplication, project_id=project_id, status='approved')
+        
+        # Перевірка доступу (соло або капітан/учасник команди)
+        has_access = (app.developer == request.user) or (app.team and request.user in app.team.members.all()) or (app.team and request.user == app.team.captain)
+        
+        if has_access and app.project.payment_status == 'frozen':
+            app.project.payment_status = 'paid'
+            app.project.save()
+            messages.success(request, f'Ви підтвердили старт робіт по проєкту "{app.project.title}".')
+        else:
+            messages.error(request, 'Помилка доступу або оплата ще не внесена.')
+            
+    return redirect('projects')
+
+# Також потрібно трохи оновити вашу функцію process_payment:
+@login_required
+def process_payment(request, project_id):
+    if request.method == 'POST' and request.user.role == 'client':
+        project = get_object_or_404(Project, id=project_id, client=request.user)
+        new_price = request.POST.get('final_price')
+        if new_price:
+            project.final_price = new_price
+            project.payment_status = 'frozen' # ТЕПЕР СТАТУС "ЗАМОРОЖЕНО"
+            project.save()
+            messages.success(request, f'Гроші за проєкт заморожені на платформі. Очікуємо підтвердження розробника.')
+    return redirect('payments')

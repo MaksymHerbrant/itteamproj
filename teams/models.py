@@ -57,7 +57,14 @@ class Project(models.Model):
     description = models.TextField()
     budget = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    
+    PAYMENT_CHOICES = (
+        ('unpaid', 'Очікує оплати'),
+        ('frozen', 'Очікує підтвердження розробника'),
+        ('paid', 'Оплачено'),
+    )
+    final_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="Фінальна ціна")
+    is_paid = models.BooleanField(default=False, verbose_name="Чи оплачено")
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_CHOICES, default='unpaid', verbose_name="Статус оплати")
     def __str__(self):
         return self.title
 
